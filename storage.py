@@ -1,102 +1,188 @@
-import json
-import os
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
+from contextlib import contextmanager
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-NOTES_FILE = os.path.join(DATA_DIR, "notes.json")
+from config import DB_PATH
 
 
-def _load(path):
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+@contextmanager
+def _conn():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
 
 
-def _save(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def init_db():
+    with _conn() as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS birthdays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                date TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                remind_at TEXT,
+                repeat TEXT NOT NULL DEFAULT 'once',
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_bdays_user ON birthdays(user_id);
+            """
+        )
 
 
-def set_birthday(user_id, date_str):
-    data = _load(USERS_FILE)
-    data[str(user_id)] = {"birthday": date_str}
-    _save(USERS_FILE, data)
+def add_birthday(user_id, name, date_str):
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO birthdays (user_id, name, date) VALUES (?, ?, ?)",
+            (user_id, name, date_str),
+        )
+        return cur.lastrowid
 
 
-def get_birthday(user_id):
-    data = _load(USERS_FILE)
-    entry = data.get(str(user_id))
-    if not entry:
-        return None
-    return entry.get("birthday")
+def get_birthdays(user_id):
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, name, date FROM birthdays WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
-def days_until_birthday(user_id):
-    bday_str = get_birthday(user_id)
-    if not bday_str:
-        return None
+def delete_birthday(user_id, bday_id):
+    with _conn() as con:
+        con.execute(
+            "DELETE FROM birthdays WHERE user_id = ? AND id = ?",
+            (user_id, bday_id),
+        )
 
-    bday = datetime.strptime(bday_str, "%d.%m.%Y")
+
+def days_until(date_str):
+    bday = datetime.strptime(date_str, "%d.%m.%Y")
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     next_bday = bday.replace(year=today.year)
-
     if next_bday < today:
         next_bday = next_bday.replace(year=today.year + 1)
-
     return (next_bday - today).days
 
 
-def add_note(user_id, text, remind_at=None):
-    data = _load(NOTES_FILE)
-    user_notes = data.get(str(user_id), [])
-
-    note = {
-        "id": len(user_notes) + 1,
-        "text": text,
-        "remind_at": remind_at,
-        "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-        "done": False
-    }
-
-    user_notes.append(note)
-    data[str(user_id)] = user_notes
-    _save(NOTES_FILE, data)
-    return note
+def add_note(user_id, text, remind_at=None, repeat="once"):
+    created = datetime.now().strftime("%d.%m.%Y %H:%M")
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO notes (user_id, text, remind_at, repeat, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, text, remind_at, repeat, created),
+        )
+        note_id = cur.lastrowid
+        row = con.execute(
+            "SELECT * FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
-def get_notes(user_id):
-    data = _load(NOTES_FILE)
-    return data.get(str(user_id), [])
+def get_notes(user_id, only_active=False):
+    sql = "SELECT * FROM notes WHERE user_id = ?"
+    params = [user_id]
+    if only_active:
+        sql += " AND done = 0"
+    sql += " ORDER BY id"
+    with _conn() as con:
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+
+
+def search_notes(user_id, query):
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM notes WHERE user_id = ? AND text LIKE ? ORDER BY id",
+            (user_id, f"%{query}%"),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_note_text(user_id, note_id, text):
+    with _conn() as con:
+        con.execute(
+            "UPDATE notes SET text = ? WHERE user_id = ? AND id = ?",
+            (text, user_id, note_id),
+        )
+
+
+def mark_note_done(user_id, note_id):
+    with _conn() as con:
+        con.execute(
+            "UPDATE notes SET done = 1 WHERE user_id = ? AND id = ?",
+            (user_id, note_id),
+        )
 
 
 def delete_note(user_id, note_id):
-    data = _load(NOTES_FILE)
-    user_notes = data.get(str(user_id), [])
-    user_notes = [n for n in user_notes if n["id"] != note_id]
-
-    for i, note in enumerate(user_notes):
-        note["id"] = i + 1
-
-    data[str(user_id)] = user_notes
-    _save(NOTES_FILE, data)
+    with _conn() as con:
+        con.execute(
+            "DELETE FROM notes WHERE user_id = ? AND id = ?",
+            (user_id, note_id),
+        )
 
 
 def get_pending_reminders():
-    data = _load(NOTES_FILE)
     now = datetime.now()
-    results = []
+    fired = []
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM notes WHERE remind_at IS NOT NULL AND done = 0"
+        ).fetchall()
 
-    for user_id, notes in data.items():
-        for note in notes:
-            if note.get("remind_at") and not note.get("done"):
-                remind_time = datetime.strptime(note["remind_at"], "%d.%m.%Y %H:%M")
-                if remind_time <= now:
-                    note["done"] = True
-                    results.append((int(user_id), note))
+        for r in rows:
+            remind_time = datetime.strptime(r["remind_at"], "%d.%m.%Y %H:%M")
+            if remind_time > now:
+                continue
 
-    _save(NOTES_FILE, data)
-    return results
+            note = dict(r)
+            fired.append((r["user_id"], note))
+
+            if r["repeat"] == "daily":
+                next_time = (remind_time + timedelta(days=1)).strftime(
+                    "%d.%m.%Y %H:%M"
+                )
+                con.execute(
+                    "UPDATE notes SET remind_at = ? WHERE id = ?",
+                    (next_time, r["id"]),
+                )
+            elif r["repeat"] == "weekly":
+                next_time = (remind_time + timedelta(days=7)).strftime(
+                    "%d.%m.%Y %H:%M"
+                )
+                con.execute(
+                    "UPDATE notes SET remind_at = ? WHERE id = ?",
+                    (next_time, r["id"]),
+                )
+            else:
+                con.execute(
+                    "UPDATE notes SET done = 1 WHERE id = ?", (r["id"],)
+                )
+    return fired
+
+
+def export_notes_text(user_id):
+    notes = get_notes(user_id)
+    if not notes:
+        return ""
+    lines = []
+    for n in notes:
+        status = "[x]" if n["done"] else "[ ]"
+        remind = f" @ {n['remind_at']}" if n["remind_at"] else ""
+        repeat = f" ({n['repeat']})" if n["repeat"] != "once" else ""
+        lines.append(f"{status} #{n['id']} {n['text']}{remind}{repeat}")
+    return "\n".join(lines)
